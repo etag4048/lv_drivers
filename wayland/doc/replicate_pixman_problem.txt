@@ -1,0 +1,73 @@
+17. Steps to replicate the problem
+**********************************
+
+When running on weston with pixman enabled the lvgl wayland driver
+crashes
+
+The problem was initially encountered when running weston 10.0.2 used
+by the Poky from the yocto project
+
+https://git.yoctoproject.org/poky/log/meta/recipes-graphics/wayland
+
+When running with pixman enabled there is a crash due to the resizing
+of buffers after the surfaces are attached..
+
+See investigation.md for details on the crash
+
+Fortunately, the error can be reproduced by running weston with the
+wayland-backend to reproduce the crash on a regular GNU/Linux
+workstation.
+
+This guide explains how to quickly replicate the issue on (Using
+Ubuntu 22.04)
+
+You will need to install the required build dependencies: "meson" and
+"ninja"
+
+The following configuration script can be used to build weston with
+most features disabled to avoid having to install a lot of
+dependencies.
+
+   # Download weston from the official repository
+
+   git clone https://gitlab.freedesktop.org/wayland/weston.git
+   git checkout a569bc2a300416344c51fa5f69e405cae41ce1fb
+   cd weston
+
+   meson -Dbackend-drm-screencast-vaapi=false \
+         -Dbackend-rdp=false \
+         -Dbackend-x11=false \
+         -Dbackend-wayland=true\
+         -Drenderer-gl=false \
+         -Dlauncher-libseat=false \
+         -Dxwayland=false \
+         -Dsystemd=false \
+         -Dremoting=false \
+         -Dpipewire=false \
+         -Dshell-ivi=true \
+         -Dsimple-clients=shm\
+         -Dlauncher-logind=false \
+         -Dlauncher-libseat=true \
+         -Dcolor-management-lcms=false \
+         -Dlauncher-logind=false \
+         -Dimage-jpeg=false \
+         -Dimage-webp=false \
+         -Ddemo-clients=false \
+         -Dresize-pool=true \
+         -Dwcap-decode=false \
+         -Dtest-gl-renderer=false \
+         -Dcolor-management-colord=false \
+         build
+    ninja -C build
+
+    # Once compilation is done, copy the required shared object.
+    cp weston/build/backend-wayland/wayland-backend.so /usr/local/lib/x86_64-linux-gnu
+
+
+    # The following start script is used to launch weston with the wayland backend using the pixman compositor
+    weston/build/compositor/weston --no-config -B wayland-backend.so --use-pixman
+
+
+    # Compile an LVGL demo application and run it like so
+    # The location of the compositor socket might differ from system to system
+    WAYLAND_DISPLAY=/var/run/user/1001/wayland-1 ./demo

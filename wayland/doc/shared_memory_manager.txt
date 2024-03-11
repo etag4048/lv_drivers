@@ -1,0 +1,314 @@
+13. Backporting the shared memory manager
+*****************************************
+
+The shared memory manager was added to the wayland driver in PR#270
+"1792ab20a394105a017e929efca65eca68e96dfa" It allows to allocate
+buffers on demand when they are needed in the "_lv_wayland_flush"
+function.
+
+The backporting to version 8.3 of lv_drivers is accomplished by
+reverting the commit "fe9de86e936037ec7252a28da72d4bf82a986866"
+
+Only the memory allocation calls need to be changed to the old names.
+
+
+14. Overview of the shared memory manager
+*****************************************
+
+The shared memory manager contained in "smm.c" is fairly simple to
+understand, it’s an abstraction layer around the functions *mmap(2)*,
+*munmap(2)*, *ftruncate(2)*, and *shm_open(3)*.
+
+For example, when the client application needs to acquire a buffer it
+requests it from the shared memory manager, and it takes care of
+resizing the shared memory segment if it’s not large enough to
+accommodate the new buffer.
+
+The manager employs the notion of *buffer groups*, buffers of the same
+size are grouped together. This is the case for the main body of the
+window, and also a buffer group is created for each individual window
+decoration.
+
+
+15. Buffer groups
+*****************
+
+Each group has two linked lists of buffers "inuse" and "unused" when a
+buffer is acquired it’s removed from the "unused" list and  put in the
+"inuse" list.
+
+The client application writes the content of LVGL’s buffer into it.
+Once attached and committed it is passed to the compositor for
+rendering. The compositor reads and then renders the buffer, when done
+it issues a "release" request. In the client application within the
+callback for the "release" request the buffer is then returned to
+shared memory manager to the "unused" list.
+
+If there are no more available buffers in the "unused" list, it gets
+one from the pool by first checking if the memory pool is large enough
+to accommodate a new buffer of the requested size, if it’s not large
+enough it uses the *ftruncate(2)* function to make it larger. A
+"resize" request is emitted to the compositor for it to also remap the
+shared memory to make it fit in it’s address space.
+
+The buffer is then created and a "create_buffer" request is emitted to
+the compositor. Finally the acquired buffer is returned to the client
+application to be drawn to.
+
+
+16. Getting it to work with weston
+**********************************
+
+It works quite well when running on GNOME, GNOME uses an EGL backend.
+Window resizing is a bit choppy, decorations are also present.
+However, when attempting to run on weston 10.0.2 with the pixman
+backend, a segmentation fault is encountered on each launch. Even
+before the first frame is shown.
+
+   Process 829507 stopped
+   * thread #1, name = 'weston', stop reason = signal SIGSEGV: invalid address (fault address: 0x7ffff649b000)
+    frame #0: 0x00007ffff79f928d libpixman-1.so.0`fast_composite_scaled_nearest_8888_8888_cover_OVER at pixman-fast-path.c:1192:619
+   1189 FAST_NEAREST (x888_8888_cover, x888, 8888, uint32_t, uint32_t, SRC, COVER)
+   1190 FAST_NEAREST (x888_8888_pad, x888, 8888, uint32_t, uint32_t, SRC, PAD)
+   1191 FAST_NEAREST (x888_8888_normal, x888, 8888, uint32_t, uint32_t, SRC, NORMAL)
+   -> 1192 FAST_NEAREST (8888_8888_cover, 8888, 8888, uint32_t, uint32_t, OVER, COVER)
+   1193 FAST_NEAREST (8888_8888_none, 8888, 8888, uint32_t, uint32_t, OVER, NONE)
+   1194 FAST_NEAREST (8888_8888_pad, 8888, 8888, uint32_t, uint32_t, OVER, PAD)
+   1195 FAST_NEAREST (8888_8888_normal, 8888, 8888, uint32_t, uint32_t, OVER, NORMAL)
+
+**Observations:**
+
+1. This only occurs when window decorations are enabled.
+
+2. It occurs even before the first frame is rendered
+
+3. Always crashes on the first decoration, the title bar.
+
+4. If the app is started in full screen, it works (decorations are
+   enabled)
+
+5. Reading the backtrace of the crash, revealed that it occurs when
+   the compositor redraws the surfaces.
+
+Here is what happens at the very start of the program, when
+decorations are created and before the first flush occurs
+
+   17894 mmap(NULL, 32768, PROT_READ|PROT_WRITE, MAP_SHARED, 30, 0) = 0x7fdf791bd000
+
+The buffer for the title bar is created @ "0x7fdf791bd000".
+
+   17936 write(2, "[3886534.047] wl_surface@16.comm"..., 35[3886534.047] wl_surface@16.commit() = 35
+   17937 write(2, ")\n", 2)
+   17938 )                      = 2
+   17940 write(2, "[09:56:44.262] buf w:0 h:0 0x55f"..., 42[09:56:44.262] buf w:0 h:0 0x55fd11ccc790
+   17941 ) = 42
+   17943 write(2, "[09:56:44.262] buf 0x55fd11ccc79"..., 46[09:56:44.262] buf 0x55fd11ccc790 ref count 1
+   17944 ) = 46
+   17946 write(2, "[09:56:44.262] Creating new pixm"..., 89[09:56:44.262] Creating new pixman renderer: 0x55fd11ccc7f0 for surface:  0x55fd11cb4ad0
+   17947 ) = 89
+   17949 write(2, "[09:56:44.262] pixman bufref:0x5"..., 44[09:56:44.262] pixman bufref:0x55fd11ccc800
+   17950 ) = 44
+   17952 write(2, "[09:56:44.263] pixman buf:0x55fd"..., 41[09:56:44.263] pixman buf:0x55fd11ccc790
+   17953 ) = 41
+   17955 write(2, "[09:56:44.263] buf w:0 h:0 0x55f"..., 42[09:56:44.263] buf w:0 h:0 0x55fd11ccc790
+   17956 ) = 42
+   17958 write(2, "[09:56:44.263] buf 0x55fd11ccc79"..., 46[09:56:44.263] buf 0x55fd11ccc790 ref count 2
+   17959 ) = 46
+   17960 newfstatat(AT_FDCWD, "/etc/localtime", {st_mode=S_IFREG|0644, st_size=1909, ...}, 0) = 0
+   17961 write(2, "[09:56:44.263] attaching shmbuff"..., 72[09:56:44.263] attaching shmbuffer:0x7fdf791bd000 width: 320 height: 24
+   17962 ) = 72
+
+The wayland driver commits the top bar (17936), a pixman renderer is
+created for the surface (17946) and the finally the buffer is attached
+to the surface (17961).
+
+   17963 write(2, "[3886534.428] wl_shm_pool@24.res"..., 36[3886534.428] wl_shm_pool@24.resize() = 36
+   17964 write(2, "36864", 536864)                    = 5
+   17965 write(2, ")\n", 2)
+   17966 )                      = 2
+   17967 mremap(0x7fdf791bd000, 32768, 36864, MREMAP_MAYMOVE) = 0x7fdf791b4000
+
+A resize request is sent by the client application to the compositor
+and as stated in the wayland.xml specification, the buffer gets
+remapped to another location by "wayland-server" library. The only
+problem is that the pixman renderer created on line 17946, still
+retains the old reference "0x7fdf791bd000"
+
+   17968 write(2, "[3886534.509] wl_shm_pool@24.cre"..., 43[3886534.509] wl_shm_pool@24.create_buffer() = 43
+   17969 write(2, "new id wl_buffer@", 17new id wl_buffer@)       = 17
+   17970 write(2, "27", 227)                       = 2
+
+   ...
+
+   18471 newfstatat(AT_FDCWD, "/etc/localtime", {st_mode=S_IFREG|0644, st_size=1909, ...}, 0) = 0
+   18472 write(2, "[09:56:44.270] attaching shmbuff"..., 71[09:56:44.270] attaching shmbuffer:0x7fdf791c2000 width: 2 height: 344
+   18473 ) = 71
+   18474 write(2, "[3886542.068] wl_shm_pool@24.res"..., 36[3886542.068] wl_shm_pool@24.resize() = 36
+   18475 write(2, "471040", 6471040)                   = 6
+   18476 write(2, ")\n", 2)
+   18477 )                      = 2
+   18478 mremap(0x7fdf791b4000, 61440, 471040, MREMAP_MAYMOVE) = 0x7fdf79009000
+
+Another resize occurs (18474) and the segment gets remapped again to
+"0x7fdf79009000"
+
+   began access psimg:0x55fd11bc0820 buf: 0x55fd11ccc790 shmbuf: 0x55fd11cd05d0 bufaddr: 0x7fdf79009000
+
+   18882 --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=0x7fdf791bd000} ---
+
+The crash occurs when the rendering occurs for buffer "0x55fd11ccc790"
+for which a rendering context was created back on line 17940 Since the
+backing buffer got remapped twice but the renderer state still points
+to "0x7fdf791bd000" which by this time became invalid memory.
+
+**Deduction:** Something in the client triggers the resize of shm
+buffer pool which in turn causes weston/libwayland-server. to remap
+already committed buffers to other locations.
+
+**Solution:** Avoid the resizing of the buffer pool once at least one
+surface is committed.
+
+   The resize event is emitted in wayland.c:1348 (in sme_expand_pool)
+
+   breakpoint set -f wayland.c -l 1348
+
+     * frame #0: 0x0000555555606613 demo`sme_expand_pool(ctx=0x00005555561a10a0, pool=0x00005555561a87b0) at wayland.c:1348:52
+       frame #1: 0x00005555556033ee demo`get_from_pool(grp=0x00005555561a8500) at smm.c:475:22
+       frame #2: 0x0000555555602b3a demo`smm_acquire(grp=0x00005555561a8500) at smm.c:238:13
+       frame #3: 0x0000555555607f75 demo`_lv_wayland_flush(disp_drv=0x00005555557a2278, area=0x00007fffffffdbe0, color_p=0x00005555557a2998) at wayland.c:2045:15
+       frame #4: 0x0000555555591e47 demo`call_flush_cb(drv=0x00005555557a2278, area=0x00007fffffffdd60, color_p=0x00005555557a2998) at lv_refr.c:1322:5
+
+The problem occurs because the buffer is acquired on demand in
+"_lv_wayland_flush" and if the pool isn’t large enough it gets resized
+and weston crashes on the next redraw..
+
+Below is the structure responsible for holding pixman’s rendering
+state, there is one such structure per surface/buffer. And it’s
+allocated when a commit request gets received for a surface.
+
+   (lldb) target create "/home/etag/wayland/weston/build/compositor/weston"
+   Current executable set to '/home/etag/wayland/weston/build/compositor/weston' (x86_64).
+   (lldb) settings set -- target.run-args  "-B" "wayland-backend.so"
+   (lldb) breakpoint set -f pixman.c -l 705 -c 'info.width == 320 && info.height == 28'
+   Breakpoint 1: no locations (pending).
+   WARNING:  Unable to resolve breakpoint to any actual locations.
+   (lldb) run
+   Process 711798 launched: '/home/etag/wayland/weston/build/compositor/weston' (x86_64)
+   (lldb) p info->src_image
+   (pixman_image_t \*) $0 = 0x000055555559b3a0
+     Fix-it applied, fixed expression was:
+       info.src_image
+   (lldb) p info.src_image
+   (pixman_image_t \*) $1 = 0x000055555559b3a0
+   (lldb) p info.src_image->bits
+   (bits_image_t) $2 = {
+     common = {
+       type = BITS
+       ref_count = 1
+       clip_region = {
+         extents = (x1 = 0, y1 = 0, x2 = 0, y2 = 0)
+         data = 0x00007ffff7a5b070
+       }
+       alpha_count = 0
+       have_clip_region = 0
+       client_clip = 0
+       clip_sources = 0
+       dirty = 0
+       transform = 0x000055555567b5d0
+       repeat = PIXMAN_REPEAT_PAD
+       filter = PIXMAN_FILTER_BILINEAR
+       filter_params = 0x0000000000000000
+       n_filter_params = 0
+       alpha_map = NULL
+       alpha_origin_x = 0
+       alpha_origin_y = 0
+       component_alpha = 0
+       property_changed = 0x00007ffff7998da1 (libpixman-1.so.0`bits_image_property_changed at pixman-bits-image.c:927:1)
+       destroy_func = 0x0000000000000000
+       destroy_data = 0x0000000000000000
+       flags = 34594422
+       extended_format_code = PIXMAN_a8r8g8b8
+     }
+     format = PIXMAN_a8r8g8b8
+     indexed = NULL
+     width = 320
+     height = 28
+     bits = 0x00007fdf791bd000                  # Dangling reference to the buffer
+     free_me = 0x0000000000000000
+     rowstride = 320
+     dither = PIXMAN_DITHER_NONE
+     dither_offset_y = 0
+     dither_offset_x = 0
+     fetch_scanline_32 = 0x00007ffff780c54f (libpixman-1.so.0`fetch_scanline_a8r8g8b8 at pixman-access.c:470:125)
+     fetch_pixel_32 = 0x00007ffff7810106 (libpixman-1.so.0`fetch_pixel_a8r8g8b8 at pixman-access.c:470:680)
+     store_scanline_32 = 0x00007ffff780d968 (libpixman-1.so.0`store_scanline_a8r8g8b8 at pixman-access.c:470:416)
+     fetch_scanline_float = 0x00007ffff78cad69 (libpixman-1.so.0`fetch_scanline_generic_float at pixman-access.c:1245:1)
+     fetch_pixel_float = 0x00007ffff78cb288 (libpixman-1.so.0`fetch_pixel_generic_float at pixman-access.c:1343:1)
+     store_scanline_float = 0x00007ffff78cacb4 (libpixman-1.so.0`store_scanline_generic_float at pixman-access.c:1219:1)
+     read_func = 0x0000000000000000
+     write_func = 0x0000000000000000
+   }
+   (lldb) p info.src_image->bits.bits
+   (uint32_t \*) $3 = 0x00007fdf791bd000
+   (lldb) memory read -fY -c16 info.src_image->bits.bits
+   error: memory read failed for 0x7fdf791bd000                    # Invalid memory
+   (lldb) session save /home/etag/wayland/topbar_badaddr.txt
+
+Here is a list of breakpoints that help understand the problem, when
+replicating it.
+
+   breakpoint set -f pixman-renderer.c -l 410 -c 'buf_addr_dbg != ps->image->bits.bits'
+   breakpoint set -f pixman-renderer.c -l 82 -c 'surface->width == 320 && surface->height == 28 && surface->renderer_state == NULL'
+   breakpoint set -f compositor.c -l 2683 -c 'pnode->surface->width == 320 && pnode->surface->height == 28'
+   breakpoint set -f pixman-renderer.c -l 742 -c 'buffer->width == 320 && buffer->height == 28'
+
+A good solution is to pre-allocate the backing buffers before
+decorations and before drawing the body of the window.
+
+Patch "0009-smm-pixman-fix.patch" accomplishes this task like so:
+
+   +    smm_resize(window->body->buffer_group, ((width * BYTES_PER_PIXEL) * height) * 2);
+   +    if (body_buf1 == NULL && body_buf2 == NULL && frame_counter == 0) {
+   +        /* Pre-allocate two buffers for the window body here */
+   +        /* This is done to avoid calling resize from flush */
+   +        body_buf1 = smm_acquire(window->body->buffer_group);
+   +        body_buf2 = smm_acquire(window->body->buffer_group);
+   +
+   +        if (smm_map(body_buf2) == NULL) {
+   +            LV_LOG_ERROR("Cannot pre-allocate backing buffers for window body");
+   +        }
+   +
+   +        /* Moves the buffers to the unused list of the group */
+   +        smm_release(body_buf1);
+   +        smm_release(body_buf2);
+   +    }
+
+The above block occurs early in the application’s life cycle, in
+"resize_window" which is called by "create_window".
+
+First a call to is made to "smm_resize" for the buffer group
+responsible for body of the window, it clears and returns the unused
+buffers of the group to the pool (at this point there aren’t any) so
+it only sets the size of the pool.
+
+The "smm_acquire" goes ahead and tries to acquire a buffer from the
+unused list, it doesn’t find any.
+
+So it takes one from the pool, the pool is not even allocated at this
+point (The size was set but it was never mapped in) The pool is
+created and the buffer is added to the "inuse" list.
+
+On the second call to "smm_acquire" the second buffer is created and
+added to "inuse".
+
+The "smm_map" call is here to test if it got mapped in
+
+Finally the "smm_release" calls simply removes the allocated buffers
+from "inuse" and puts them in the "unused" list.
+
+So that the "smm_acquire" call situated in "_lv_wayland_flush" only
+retrieves the buffer from the "unused" list and doesn’t try to resize
+the pool in the middle of the rendering cycle..
+
+Resizing the pool only works on compositors featuring an EGL backend
+but crashes with a pixman backend.

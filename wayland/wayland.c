@@ -1163,9 +1163,25 @@ static void xdg_surface_handle_configure(void *data, struct xdg_surface *xdg_sur
 
     if (window->body->surface_configured == false)
     {
-        draw_window(window, window->width, window->height);
-    }
+        /* This branch is executed at launch */
+        if (window->resize_pending == false)
+        {
+            /* Use the size passed to the create_window function */
+            draw_window(window, window->width, window->height);
 
+        }
+        else
+        {
+
+            /* Handle early maximization or fullscreen, */
+            /* by using the size communicated by the compositor */
+            /* when the initial xdg configure event arrives  */
+            draw_window(window, window->resize_width, window->resize_height);
+            window->width = window->resize_width;
+            window->height = window->resize_height;
+            window->resize_pending = false;
+        }
+    }
     window->body->surface_configured = true;
 }
 
@@ -1178,16 +1194,14 @@ static void xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *xdg_t
 {
     struct window *window = (struct window *)data;
 
-#if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
-    if (!window->application->opt_disable_decorations && !window->fullscreen)
-    {
-        width -= (2 * BORDER_SIZE);
-        height -= (TITLE_BAR_HEIGHT + (2 * BORDER_SIZE));
-    }
-#endif
+    LV_LOG_TRACE("w:%d h:%d", width, height);
+    LV_LOG_TRACE("current body w:%d h:%d", window->body->width, window->body->height);
+    LV_LOG_TRACE("window w:%d h:%d", window->width, window->height);
+
 
     if ((width <= 0) || (height <= 0))
     {
+        LV_LOG_TRACE("will not resize to w:%d h:%d", width, height);
         return;
     }
 
@@ -1196,6 +1210,11 @@ static void xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *xdg_t
         window->resize_width = width;
         window->resize_height = height;
         window->resize_pending = true;
+        LV_LOG_TRACE("resize_pending is set, will resize to w:%d h:%d", width, height);
+    }
+    else
+    {
+        LV_LOG_TRACE("resize_pending not set w:%d h:%d", width, height);
     }
 }
 
@@ -1448,6 +1467,7 @@ static bool sme_new_buffer(void *ctx, smm_buffer_t *buf)
     struct application *app = ctx;
     struct graphic_object *obj = SMM_GROUP_PROPERTIES(props->group)->tag[TAG_LOCAL];
 
+    LV_LOG_TRACE("create new buffer of width %d height %d", obj->width, obj->height);
     wl_buf = wl_shm_pool_create_buffer(wl_pool,
                                        props->offset,
                                        obj->width,
@@ -1659,8 +1679,22 @@ static bool attach_decoration(struct window *window, struct graphic_object * dec
         return false;
     }
 
+    /* Enable this, to make it function on weston 10.0.2 */
+    /* It's not elegant but it forces weston to size the surfaces before */
+    /* the conversion to a subsurface takes place */
+
+    /* Likely related to this issue, some patches were merged into 10.0.0 */
+    /* https://gitlab.freedesktop.org/wayland/weston/-/issues/446 */
+    /* Moreover, it crashes on GNOME */
+
+#if 0
+    wl_surface_attach(decoration->surface, wl_buf, 0, 0);
+    wl_surface_commit(decoration->surface);
+#endif
+
     if(decoration->subsurface == NULL) {
         /* Create the subsurface only once */
+
         decoration->subsurface = wl_subcompositor_get_subsurface(window->application->subcompositor,
                                                                  decoration->surface,
                                                                  parent->surface);
@@ -1669,6 +1703,7 @@ static bool attach_decoration(struct window *window, struct graphic_object * dec
             LV_LOG_ERROR("cannot get subsurface for decoration");
             goto err_destroy_surface;
         }
+
     }
 
     wl_subsurface_set_position(decoration->subsurface, pos_x, pos_y);
@@ -1733,6 +1768,7 @@ static bool create_decoration(struct window *window,
         LV_ASSERT_MSG(0, "Invalid object type");
         return false;
     }
+    LV_LOG_TRACE("decoration window %dx%d", decoration->width, decoration->height);
 
     smm_resize(decoration->buffer_group,
                (decoration->width * BYTES_PER_PIXEL) * decoration->height);
@@ -1854,14 +1890,20 @@ static bool resize_window(struct window *window, int width, int height)
     struct smm_buffer_t *body_buf2;
     int b;
 
-    LV_LOG_TRACE("resize window %dx%d frame: %ld rendered: %d",
-            width, height, window->frame_counter, window->frame_done);
-
-    /* Update size for newly allocated buffers */
-    smm_resize(window->body->buffer_group, ((width * BYTES_PER_PIXEL) * height) * 2);
 
     window->width = width;
     window->height = height;
+
+#if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
+    if (!window->application->opt_disable_decorations && !window->fullscreen)
+    {
+        width -= (2 * BORDER_SIZE);
+        height -= (TITLE_BAR_HEIGHT + (2 * BORDER_SIZE));
+    }
+#endif
+
+    /* Update size for newly allocated buffers */
+    smm_resize(window->body->buffer_group, ((width * BYTES_PER_PIXEL) * height) * 2);
 
     window->body->width = width;
     window->body->height = height;
@@ -1907,6 +1949,14 @@ static bool resize_window(struct window *window, int width, int height)
     }
 #endif
 
+    LV_LOG_TRACE("resize window:%dx%d body:%dx%d frame: %ld rendered: %d",
+            window->width, window->height,
+            window->body->width, window->body->height,
+            window->frame_counter, window->frame_done);
+
+    width = window->body->width;
+    height = window->body->height;
+
     if (window->lv_disp != NULL)
     {
         /* Resize draw buffer */
@@ -1932,6 +1982,12 @@ static bool resize_window(struct window *window, int width, int height)
     return true;
 }
 
+/* @brief Create a window
+ * @description Creates the graphical context for the window body, and then create a toplevel
+ * wayland surface and commit it to obtain an XDG configuration event
+ * @param width the height of the window w/decorations
+ * @param height the width of the window w/decorations
+*/
 static struct window *create_window(struct application *app, int width, int height, const char *title)
 {
     struct window *window;
@@ -1990,10 +2046,6 @@ static struct window *create_window(struct application *app, int width, int heig
         // An (XDG) surface commit (without an attached buffer) triggers this
         // configure event
         window->body->surface_configured = false;
-        wl_surface_commit(window->body->surface);
-        /* Manually dispatching the queue is required to */
-        /* ensure that configure gets called right away. */
-        wl_display_dispatch(application.display);
     }
 #endif
 #if LV_WAYLAND_WL_SHELL
@@ -2490,8 +2542,8 @@ int lv_wayland_get_fd(void)
 
 /**
  * Create wayland window
- * @param hor_res initial horizontal window size in pixels
- * @param ver_res initial vertical window size in pixels
+ * @param hor_res initial horizontal window body size in pixels
+ * @param ver_res initial vertical window body size in pixels
  * @param title window title
  * @param close_cb function to be called when the window gets closed by the user (optional)
  * @return new display backed by a Wayland window, or NULL on error
@@ -2501,8 +2553,24 @@ lv_disp_t * lv_wayland_create_window(lv_coord_t hor_res, lv_coord_t ver_res, cha
 {
     lv_color_t * buf1 = NULL;
     struct window *window;
+    int32_t window_width;
+    int32_t window_height;
 
-    window = create_window(&application, hor_res, ver_res, title);
+    window_width = hor_res;
+    window_height = ver_res;
+
+    #if LV_WAYLAND_CLIENT_SIDE_DECORATIONS
+
+    /* Decorations are enabled, caculate the body size */
+    if (!application.opt_disable_decorations)
+    {
+        window_width = hor_res + (2 * BORDER_SIZE);
+        window_height = ver_res + (TITLE_BAR_HEIGHT + (2 * BORDER_SIZE));
+    }
+
+    #endif
+
+    window = create_window(&application, window_width, window_height, title);
     if (!window)
     {
         LV_LOG_ERROR("failed to create wayland window");
@@ -2620,6 +2688,58 @@ bool lv_wayland_window_is_open(lv_disp_t * disp)
     }
 
    return open;
+}
+/**
+ * Set/unset window maximization mode
+ * @description Maximization is nearly the same as fullscreen, except
+ * window decorations and the compositor's panels must remain visible
+ * @param disp LVGL display using window to be set/unset maximization
+ * @param Maximization requested status (true = maximized)
+ */
+void lv_wayland_window_set_maximized(lv_disp_t * disp, bool maximized)
+{
+    struct window *window = disp->driver->user_data;
+    if (!window || window->closed)
+    {
+        return;
+    }
+
+    if (window->maximized != maximized)
+    {
+
+#if LV_WAYLAND_WL_SHELL
+        if (window->wl_shell)
+        {
+            if (maximized)
+            {
+                wl_shell_surface_set_maximized(window->wl_shell);
+            }
+            else
+            {
+                wl_shell_surface_set_toplevel(window->wl_shell_surface);
+            }
+            window->maximized = maximized;
+            window->flush_pending = true;
+        }
+#endif
+
+#if LV_WAYLAND_XDG_SHELL
+        if (window->xdg_toplevel)
+        {
+            if (maximized)
+            {
+                xdg_toplevel_set_maximized(window->xdg_toplevel);
+            }
+            else
+            {
+                xdg_toplevel_unset_maximized(window->xdg_toplevel);
+            }
+
+            window->maximized = maximized;
+            window->flush_pending = true;
+        }
+#endif
+    }
 }
 
 /**
@@ -2755,7 +2875,7 @@ uint32_t lv_wayland_timer_handler(void)
     /* Wayland input handling - it will also trigger the frame done handler */
     _lv_wayland_handle_input();
 
-    /* Ready input timers (to probe for any input recieved) */
+    /* Ready input timers (to probe for any input received) */
     _LV_LL_READ(&application.window_ll, window)
     {
         LV_LOG_TRACE("handle timer frame: %ld", window->frame_counter);
@@ -2766,8 +2886,15 @@ uint32_t lv_wayland_timer_handler(void)
             LV_LOG_TRACE("LVGL is going too fast or window is hidden");
             return LV_DISP_DEF_REFR_PERIOD;
         }
-        else if (window != NULL &&
-                window->resize_pending && window->frame_counter > 0)
+        else if (window != NULL && window->body->surface_configured == false)
+        {
+            /* Initial commit to trigger the configure event */
+            /* Manually dispatching the queue is necessary, */
+            /* to emit the configure event straight away */
+            wl_surface_commit(window->body->surface);
+            wl_display_dispatch(application.display);
+        }
+        else if (window != NULL && window->resize_pending)
         {
             if (resize_window(window, window->resize_width, window->resize_height))
             {

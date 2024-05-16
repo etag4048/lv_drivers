@@ -1,5 +1,5 @@
 /**
- * @file wayland
+ * @file wayland.h
  *
  */
 
@@ -29,9 +29,6 @@ extern "C" {
 #include "lvgl/lvgl.h"
 #endif
 
-#if LV_USE_USER_DATA == 0
-#error "Support for user data is required by wayland driver. Set LV_USE_USER_DATA to 1 in lv_conf.h"
-#endif
 
 
 /*********************

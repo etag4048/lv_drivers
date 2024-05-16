@@ -1,7 +1,15 @@
-/**
- * @file wayland.c
+/*******************************************************************
  *
- */
+ * wayland.c - The Wayland client for LVGL applications
+ *
+ * Based on the original file from the repository.
+ *
+ * Porting to LVGL 9.1
+ * Copyright (2024) EDGEMTech Ltd. by Erik Tagirov (erik.tagirov@edgemtech.ch)
+ *
+ * See LICENSE.txt for details
+ *
+ ******************************************************************/
 
 /*********************
  *      INCLUDES

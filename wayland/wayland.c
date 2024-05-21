@@ -1713,7 +1713,6 @@ static bool attach_decoration(struct window *window, struct graphic_object * dec
             LV_LOG_ERROR("cannot get subsurface for decoration");
             goto err_destroy_surface;
         }
-
     }
 
     wl_subsurface_set_position(decoration->subsurface, pos_x, pos_y);
@@ -1754,11 +1753,14 @@ static void color_fill(void *pixels, lv_color_t color, uint32_t width, uint32_t 
     unsigned char *buf = pixels;
     unsigned char *buf_end;
 
+    buf_end = (unsigned char *)buf + (width * BYTES_PER_PIXEL) * height;
+
 #elif (LV_COLOR_DEPTH == 16)
 
     uint16_t *buf = pixels;
     uint16_t *buf_end;
 
+    buf_end = (uint16_t *)buf + (width * BYTES_PER_PIXEL) * height;
 #endif
 
     while (buf <= buf_end)
@@ -1854,7 +1856,7 @@ static bool create_decoration(struct window *window,
     switch (decoration->type)
     {
     case OBJECT_TITLEBAR:
-        color_fill(buf_base, lv_color_make(0xFF, 0x00, 0x00), decoration->width, decoration->height);
+        color_fill(buf_base, lv_color_make(0x66, 0x66, 0x66), decoration->width, decoration->height);
         break;
     case OBJECT_BUTTON_CLOSE:
         color_fill(buf_base, lv_color_make(0xCC, 0xCC, 0xCC), decoration->width, decoration->height);
@@ -2784,6 +2786,8 @@ void lv_wayland_window_set_maximized(lv_disp_t * disp, bool maximized)
         {
             if (maximized)
             {
+                /* Maximizing the wl_shell is possible, but requires binding to wl_output */
+                /* The wl_shell has been deperacted */
                 //wl_shell_surface_set_maximized(window->wl_shell_surface);
             }
             else

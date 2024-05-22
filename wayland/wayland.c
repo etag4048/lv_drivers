@@ -49,7 +49,6 @@
  *      DEFINES
  *********************/
 
-#define BYTES_PER_PIXEL ((LV_COLOR_DEPTH + 7) / 8)
 #define LVGL_DRAW_BUFFER_DIV (8)
 #define DMG_CACHE_CAPACITY (32)
 #define TAG_LOCAL         (0)
@@ -65,6 +64,12 @@
 
 #ifndef LV_WAYLAND_CYCLE_PERIOD
 #define LV_WAYLAND_CYCLE_PERIOD LV_MIN(LV_DEF_REFR_PERIOD,1)
+#endif
+
+#define SHM_FORMAT_UNKNOWN 0xFFFFFF
+
+#if (LV_COLOR_DEPTH == 8 || LV_COLOR_DEPTH == 1)
+#error [wayland] Unsupported LV_COLOR_DEPTH
 #endif
 
 /**********************
@@ -172,7 +177,7 @@ struct application
     bool opt_disable_decorations;
 #endif
 
-    uint32_t format;
+    uint32_t shm_format;
 
     struct xkb_context *xkb_context;
 
@@ -247,6 +252,9 @@ struct window
 static struct application application;
 
 static void color_fill(void *pixels, lv_color_t color, uint32_t width, uint32_t height);
+static void color_fill_XRGB8888(void *pixels, lv_color_t color, uint32_t width, uint32_t height);
+static void color_fill_RGB565(void *pixels, lv_color_t color, uint32_t width, uint32_t height);
+
 static const struct wl_callback_listener wl_surface_frame_listener;
 static bool resize_window(struct window *window, int width, int height);
 static struct graphic_object * create_graphic_obj(struct application *app, struct window *window,
@@ -303,38 +311,33 @@ static unsigned int _atoi(const char ** str)
     }
     return i;
 }
-
+/*
+ *  @brief shm_format
+ *  @description called by the compositor to advertise the supported
+ *  color formats for SHM buffers, there is a call per supported format
+ */
 static void shm_format(void *data, struct wl_shm *wl_shm, uint32_t format)
 {
     struct application *app = data;
 
-    switch (format)
-    {
-#if (LV_COLOR_DEPTH == 32)
-    case WL_SHM_FORMAT_ARGB8888:
-        app->format = format;
-        break;
-    case WL_SHM_FORMAT_XRGB8888:
-        if (app->format != WL_SHM_FORMAT_ARGB8888)
-        {
-            app->format = format;
-        }
-        break;
-#elif (LV_COLOR_DEPTH == 16)
-    case WL_SHM_FORMAT_RGB565:
-        app->format = format;
-        break;
-#elif (LV_COLOR_DEPTH == 8)
-    case WL_SHM_FORMAT_RGB332:
-        app->format = format;
-        break;
-#elif (LV_COLOR_DEPTH == 1)
-    case WL_SHM_FORMAT_RGB332:
-        app->format = format;
-        break;
-#endif
-    default:
-        break;
+    LV_LOG_TRACE("Supported color space fourcc.h code: %08X", format);
+
+    if (LV_COLOR_DEPTH == 32 && format == WL_SHM_FORMAT_ARGB8888) {
+
+        /* Wayland compositors MUST support ARGB8888 */
+        app->shm_format = format;
+
+    } else if (LV_COLOR_DEPTH == 32 &&
+               format == WL_SHM_FORMAT_XRGB8888 &&
+               app->shm_format != WL_SHM_FORMAT_ARGB8888) {
+
+        /* Select XRGB only if the compositor doesn't support transprancy */
+        app->shm_format = format;
+
+    } else if (LV_COLOR_DEPTH == 16 && format == WL_SHM_FORMAT_RGB565) {
+
+        app->shm_format = format;
+
     }
 }
 
@@ -1408,6 +1411,7 @@ static void cache_apply_areas(struct window *window, void *dest, void *src, smm_
     smm_buffer_t *next_buf = smm_next(src_buf);
     const struct smm_buffer_properties *props = SMM_BUFFER_PROPERTIES(src_buf);
     struct graphic_object *obj = SMM_GROUP_PROPERTIES(props->group)->tag[TAG_LOCAL];
+    uint8_t bpp;
 
     if (next_buf == NULL)
     {
@@ -1418,6 +1422,7 @@ static void cache_apply_areas(struct window *window, void *dest, void *src, smm_
         next_dmg = SMM_BUFFER_PROPERTIES(next_buf)->tag[TAG_BUFFER_DAMAGE];
     }
 
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
 
     /* Apply all buffer damage areas */
     start = ((lv_area_t *)SMM_BUFFER_PROPERTIES(src_buf)->tag[TAG_BUFFER_DAMAGE] - window->dmg_cache.cache);
@@ -1427,11 +1432,11 @@ static void cache_apply_areas(struct window *window, void *dest, void *src, smm_
         dmg = (window->dmg_cache.cache + start);
         for (y = dmg->y1; y <= dmg->y2; y++)
         {
-            offset = (dmg->x1 + (y * obj->width)) * BYTES_PER_PIXEL;
+            offset = (dmg->x1 + (y * obj->width)) * bpp;
 
             memcpy(((char *)dest) + offset,
                    ((char *)src) + offset,
-                   ((dmg->x2 - dmg->x1 + 1) * BYTES_PER_PIXEL));
+                   ((dmg->x2 - dmg->x1 + 1) * bpp));
         }
 
 
@@ -1476,14 +1481,17 @@ static bool sme_new_buffer(void *ctx, smm_buffer_t *buf)
     struct wl_shm_pool *wl_pool = SMM_POOL_PROPERTIES(props->pool)->tag[TAG_LOCAL];
     struct application *app = ctx;
     struct graphic_object *obj = SMM_GROUP_PROPERTIES(props->group)->tag[TAG_LOCAL];
+    uint8_t bpp;
 
     LV_LOG_TRACE("create new buffer of width %d height %d", obj->width, obj->height);
+
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
     wl_buf = wl_shm_pool_create_buffer(wl_pool,
                                        props->offset,
                                        obj->width,
                                        obj->height,
-                                       obj->width * BYTES_PER_PIXEL,
-                                       app->format);
+                                       obj->width * bpp,
+                                       app->shm_format);
 
     if (wl_buf != NULL) {
         wl_buffer_add_listener(wl_buf, &wl_buffer_listener, buf);
@@ -1504,6 +1512,7 @@ static bool sme_init_buffer(void *ctx, smm_buffer_t *buf)
     void *buf_base = smm_map(buf);
     const struct smm_buffer_properties *props = SMM_BUFFER_PROPERTIES(buf);
     struct graphic_object *obj = SMM_GROUP_PROPERTIES(props->group)->tag[TAG_LOCAL];
+    uint8_t bpp;
 
     if (buf_base == NULL)
     {
@@ -1520,6 +1529,8 @@ static bool sme_init_buffer(void *ctx, smm_buffer_t *buf)
             break;
         }
     }
+
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
 
     if ((smm_next(buf) == NULL) || dmg_missing)
     {
@@ -1540,7 +1551,7 @@ static bool sme_init_buffer(void *ctx, smm_buffer_t *buf)
 
             memcpy(buf_base,
                    src_base,
-                   (obj->width * BYTES_PER_PIXEL) * obj->height);
+                   (obj->width * bpp) * obj->height);
         }
     }
     else
@@ -1737,7 +1748,6 @@ err_destroy_surface:
  * A conversion is performed to match the format of the SHM buffer read by the compositor.
  *
  * This function can also be used as a visual debugging aid to see how damage is applied
- * TODO: Convert RGB332 & gray scale to ARGB8888
  *
  * @param pixels pointer to the buffer to fill
  * @param lv_color_t color the color that will be used for the fill
@@ -1748,37 +1758,50 @@ err_destroy_surface:
 static void color_fill(void *pixels, lv_color_t color, uint32_t width, uint32_t height)
 {
 
-#if (LV_COLOR_DEPTH == 32)
+    switch (application.shm_format) {
+        case WL_SHM_FORMAT_ARGB8888:
+            color_fill_XRGB8888(pixels, color, width, height);
+            break;
+        case WL_SHM_FORMAT_RGB565:
+            color_fill_RGB565(pixels, color, width, height);
+            break;
+        default:
+            LV_ASSERT_MSG(0, "Unsupported WL_SHM_FORMAT");
+            break;
+    }
+}
 
+static void color_fill_XRGB8888(void *pixels, lv_color_t color, uint32_t width, uint32_t height)
+{
     unsigned char *buf = pixels;
     unsigned char *buf_end;
+    uint8_t bpp;
 
-    buf_end = (unsigned char *)buf + (width * BYTES_PER_PIXEL) * height;
-
-#elif (LV_COLOR_DEPTH == 16)
-
-    uint16_t *buf = pixels;
-    uint16_t *buf_end;
-
-    buf_end = (uint16_t *)buf + (width * BYTES_PER_PIXEL) * height;
-#endif
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
+    buf_end = (unsigned char *)buf + (width * bpp) * height;
 
     while (buf <= buf_end)
     {
-
-#if (LV_COLOR_DEPTH == 32)
-
         *(buf++) = color.blue;
         *(buf++) = color.green;
         *(buf++) = color.red;
         *(buf++) = 0xFF;
+    }
 
-#elif (LV_COLOR_DEPTH == 16)
+}
 
+static void color_fill_RGB565(void *pixels, lv_color_t color, uint32_t width, uint32_t height)
+{
+    uint16_t *buf = pixels;
+    uint16_t *buf_end;
+    uint8_t bpp;
+
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
+    buf_end = (uint16_t *)buf + (width * bpp) * height;
+
+    while (buf <= buf_end)
+    {
         *(buf++) = lv_color_to_u16(color);
-
-#endif
-
     }
 }
 
@@ -1791,6 +1814,7 @@ static bool create_decoration(struct window *window,
     void *buf_base;
     int x, y;
     lv_color_t *pixel;
+    uint8_t bpp;
 
     switch (decoration->type)
     {
@@ -1832,10 +1856,13 @@ static bool create_decoration(struct window *window,
         LV_ASSERT_MSG(0, "Invalid object type");
         return false;
     }
+
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
+
     LV_LOG_TRACE("decoration window %dx%d", decoration->width, decoration->height);
 
     smm_resize(decoration->buffer_group,
-               (decoration->width * BYTES_PER_PIXEL) * decoration->height);
+               (decoration->width * bpp) * decoration->height);
 
     buf = smm_acquire(decoration->buffer_group);
 
@@ -1864,17 +1891,16 @@ static bool create_decoration(struct window *window,
         {
             for (x = 0; x < decoration->width; x++)
             {
-                pixel = (lv_color_t*)((unsigned char *)buf_base + (y * (decoration->width * BYTES_PER_PIXEL)) + x * BYTES_PER_PIXEL);
+                pixel = (lv_color_t*)((unsigned char *)buf_base + (y * (decoration->width * bpp)) + x * bpp);
                 if ((x >= BUTTON_PADDING) && (x < decoration->width - BUTTON_PADDING))
                 {
                     if ((x == y) || (x == decoration->width - 1 - y))
                     {
-                        *pixel = lv_color_make(0x33, 0x33, 0x33);
+                        color_fill(pixel, lv_color_make(0x33, 0x33, 0x33), 0, 0);
                     }
                     else if ((x == y - 1) || (x == decoration->width - y))
                     {
-                        *pixel = lv_color_make(0x66, 0x66, 0x66);
-
+                        color_fill(pixel, lv_color_make(0x66, 0x66, 0x66), 0, 0);
                     }
                 }
             }
@@ -1887,14 +1913,14 @@ static bool create_decoration(struct window *window,
         {
             for (x = 0; x < decoration->width; x++)
             {
-                pixel = (lv_color_t*)((unsigned char *)buf_base + (y * (decoration->width * BYTES_PER_PIXEL)) + x * BYTES_PER_PIXEL);
+                pixel = (lv_color_t*)((unsigned char *)buf_base + (y * (decoration->width * bpp)) + x * bpp);
                 if (((x == BUTTON_PADDING) && (y >= BUTTON_PADDING) && (y < decoration->height - BUTTON_PADDING)) ||
                     ((x == (decoration->width - BUTTON_PADDING)) && (y >= BUTTON_PADDING) && (y <= decoration->height - BUTTON_PADDING)) ||
                     ((y == BUTTON_PADDING) && (x >= BUTTON_PADDING) && (x < decoration->width - BUTTON_PADDING)) ||
                     ((y == (BUTTON_PADDING + 1)) && (x >= BUTTON_PADDING) && (x < decoration->width - BUTTON_PADDING)) ||
                     ((y == (decoration->height - BUTTON_PADDING)) && (x >= BUTTON_PADDING) && (x < decoration->width - BUTTON_PADDING)))
                 {
-                    *pixel = lv_color_make(0x33, 0x33, 0x33);
+                    color_fill(pixel, lv_color_make(0x33, 0x33, 0x33), 0, 0);
                 }
             }
         }
@@ -1905,11 +1931,11 @@ static bool create_decoration(struct window *window,
         {
             for (x = 0; x < decoration->width; x++)
             {
-                pixel = (lv_color_t*)((unsigned char *)buf_base + (y * (decoration->width * BYTES_PER_PIXEL)) + x * BYTES_PER_PIXEL);
+                pixel = (lv_color_t*)((unsigned char *)buf_base + (y * (decoration->width * bpp)) + x * bpp);
                 if ((x >= BUTTON_PADDING) && (x < decoration->width - BUTTON_PADDING) &&
                     (y > decoration->height - (2 * BUTTON_PADDING)) && (y < decoration->height - BUTTON_PADDING))
                 {
-                    *pixel = lv_color_make(0x33, 0x33, 0x33);
+                    color_fill(pixel, lv_color_make(0x33, 0x33, 0x33), 0, 0);
                 }
             }
         }
@@ -1950,6 +1976,7 @@ static bool resize_window(struct window *window, int width, int height)
     struct smm_buffer_t *body_buf2;
     int b;
     uint32_t stride;
+    uint8_t bpp;
 
 
     window->width = width;
@@ -1963,8 +1990,10 @@ static bool resize_window(struct window *window, int width, int height)
     }
 #endif
 
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
+
     /* Update size for newly allocated buffers */
-    smm_resize(window->body->buffer_group, ((width * BYTES_PER_PIXEL) * height) * 2);
+    smm_resize(window->body->buffer_group, ((width * bpp) * height) * 2);
 
     window->body->width = width;
     window->body->height = height;
@@ -2202,11 +2231,13 @@ static void _lv_wayland_flush(lv_display_t *disp, const lv_area_t *area, unsigne
     smm_buffer_t *buf;
     struct wl_callback *cb;
     lv_display_rotation_t rot;
+    uint8_t bpp;
 
     window = lv_display_get_user_data(disp);
     buf = window->body->pending_buffer;
     src_width = (area->x2 - area->x1 + 1);
     src_height = (area->y2 - area->y1 + 1);
+    bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
 
     rot = lv_display_get_rotation(disp);
     w = lv_display_get_horizontal_resolution(disp);
@@ -2254,23 +2285,11 @@ static void _lv_wayland_flush(lv_display_t *disp, const lv_area_t *area, unsigne
     /* Modify specified area in buffer */
     for (y = area->y1; y <= area->y2; y++)
     {
-        offset = ((area->x1 + (y * hres)) * BYTES_PER_PIXEL);
-#if (LV_COLOR_DEPTH == 1)
-        for (x = 0; x < src_width; x++)
-        {
-            uint8_t * const dest = (uint8_t *)buf_base + offset + x;
-            *dest = ((0x07 * color_p->ch.red)   << 5) |
-                    ((0x07 * color_p->ch.green) << 2) |
-                    ((0x03 * color_p->ch.blue)  << 0);
-            color_p++;
-        }
-#else
+        offset = ((area->x1 + (y * hres)) * bpp);
         memcpy(((char *)buf_base) + offset,
                color_p,
-               src_width * BYTES_PER_PIXEL);
-        color_p += src_width * BYTES_PER_PIXEL;
-
-#endif
+               src_width * bpp);
+        color_p += src_width * bpp;
     }
 
     /* Mark surface damage */
@@ -2479,7 +2498,6 @@ void lv_wayland_init(void)
         sme_free_buffer
     };
 
-
     application.xdg_runtime_dir = getenv("XDG_RUNTIME_DIR");
     LV_ASSERT_MSG(application.xdg_runtime_dir, "cannot get XDG_RUNTIME_DIR");
 
@@ -2500,7 +2518,7 @@ void lv_wayland_init(void)
     }
 
     /* Add registry listener and wait for registry reception */
-    application.format = 0xFFFFFFFF;
+    application.shm_format = SHM_FORMAT_UNKNOWN;
     application.registry = wl_display_get_registry(application.display);
     wl_registry_add_listener(application.registry, &registry_listener, &application);
     wl_display_dispatch(application.display);
@@ -2518,9 +2536,10 @@ void lv_wayland_init(void)
         return;
     }
 
-    LV_ASSERT_MSG((application.format != 0xFFFFFFFF), "WL_SHM_FORMAT not available");
-    if (application.format == 0xFFFFFFFF)
+    LV_ASSERT_MSG((application.shm_format != SHM_FORMAT_UNKNOWN), "WL_SHM_FORMAT not available");
+    if (application.shm_format == SHM_FORMAT_UNKNOWN)
     {
+        LV_LOG_TRACE("Unable to match a suitable SHM format for selected LVGL color depth");
         return;
     }
 
